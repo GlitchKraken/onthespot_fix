@@ -13,7 +13,7 @@ from .api.youtube_music import youtube_music_get_channel_track_ids, youtube_musi
 from .api.generic import generic_get_track_metadata
 from .api.crunchyroll import crunchyroll_get_show_episode_ids
 from .runtimedata import account_pool, get_logger, parsing, download_queue, pending, parsing_lock, pending_lock
-from .utils import format_local_id
+from .utils import format_local_id, RateLimitedError
 from .otsconfig import config
 
 logger = get_logger('parse_item')
@@ -327,6 +327,16 @@ def parsingworker():
                                 'parent_category': current_type
                                 }
                     continue
+            except RateLimitedError as e:
+                logger.warning(f"Rate limited while parsing {current_id}, backing off {e.retry_after}s")
+                with parsing_lock:
+                    parsing[current_id] = {
+                        'item_url': current_url,
+                        'item_service': current_service,
+                        'item_type': current_type,
+                        'item_id': current_id,
+                    }
+                time.sleep(e.retry_after)
             except Exception as e:
                 logger.error(f"Unknown Exception: {str(e)}\nTraceback: {traceback.format_exc()}")
                 continue

@@ -18,6 +18,12 @@ from .runtimedata import get_logger, pending, download_queue
 logger = get_logger("utils")
 
 
+class RateLimitedError(Exception):
+    def __init__(self, retry_after=30, url=''):
+        self.retry_after = retry_after
+        super().__init__(f"Rate limited (429) for {url}, retry after {retry_after}s")
+
+
 class SSLAdapter(requests.adapters.HTTPAdapter):
     def __init__(self, ssl_context, *args, **kwargs):
         self.ssl_context = ssl_context
@@ -63,6 +69,10 @@ def make_call(url, params=None, headers=None, session=None, skip_cache=False, te
         if text:
             return response.text
         return json.loads(response.text)
+    elif response.status_code == 429:
+        retry_after = int(response.headers.get('Retry-After', 30))
+        logger.warning(f"Rate limited (429) for {url}, retry after {retry_after}s")
+        raise RateLimitedError(retry_after=retry_after, url=url)
     else:
         logger.info(f"Request status error {response.status_code}: {url}")
         return None

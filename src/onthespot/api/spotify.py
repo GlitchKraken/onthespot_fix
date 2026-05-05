@@ -18,6 +18,12 @@ logger = get_logger("api.spotify")
 BASE_URL = "https://api.spotify.com/v1"
 
 
+class SpotifyRateLimitError(Exception):
+    def __init__(self, retry_after):
+        self.retry_after = retry_after
+        super().__init__(f"Spotify rate limit exceeded, retry after {retry_after}s")
+
+
 class MirrorSpotifyPlayback(QObject):
     def __init__(self):
         super().__init__()
@@ -45,8 +51,9 @@ class MirrorSpotifyPlayback(QObject):
     def run(self):
         # Circular Import
         from ..accounts import get_account_token
+        poll_interval = 30
         while self.is_running:
-            time.sleep(5)
+            time.sleep(poll_interval)
             try:
                 token = get_account_token('spotify').tokens()
             except (AttributeError, IndexError):
@@ -61,6 +68,14 @@ class MirrorSpotifyPlayback(QObject):
                 spotify_re_init_session(account_pool[parsing_index])
                 token = account_pool[parsing_index]['login']['session']
                 continue
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get('Retry-After', 300))
+                # Enforce minimum 5-minute backoff to avoid Spotify's escalating ban
+                backoff = max(retry_after, 300)
+                logger.warning(f"MirrorSpotifyPlayback rate limited, backing off for {backoff}s")
+                poll_interval = backoff
+                continue
+            poll_interval = 30
             if resp.status_code == 200:
                 data = resp.json()
                 if data['currently_playing_type'] == 'track':
@@ -277,10 +292,29 @@ def spotify_get_artist_album_ids(token, artist_id):
 
 def spotify_get_playlist_data(token, playlist_id):
     logger.info(f"Get playlist data for playlist: {playlist_id}")
-    headers = {}
-    headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
-    resp = make_call(f'{BASE_URL}/playlists/{playlist_id}', headers=headers, skip_cache=True)
-    return resp['name'], resp['owner']['display_name']
+    from librespot.proto import Playlist4External_pb2
+    from ..utils import RateLimitedError
+
+    headers = {
+        'Authorization': f"Bearer {token.tokens().get('user-read-email')}",
+        'app-platform': 'WebPlayer',
+    }
+    resp = requests.get(
+        f"https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}",
+        headers=headers
+    )
+    if resp.status_code == 429:
+        raise RateLimitedError(retry_after=int(resp.headers.get('Retry-After', 30)), url=resp.url)
+    if resp.status_code != 200:
+        logger.error(f"spclient playlist data returned status {resp.status_code}")
+        return '', ''
+
+    contents = Playlist4External_pb2.SelectedListContent()
+    contents.ParseFromString(resp.content)
+
+    name = contents.attributes.name
+    owner = contents.owner_username
+    return name, owner
 
 
 def spotify_get_lyrics(token, item_id, item_type, metadata, filepath):
@@ -381,22 +415,40 @@ def spotify_get_lyrics(token, item_id, item_type, metadata, filepath):
 
 def spotify_get_playlist_items(token, playlist_id):
     logger.info(f"Getting items in playlist: '{playlist_id}'")
+    from librespot.proto import Playlist4External_pb2
+    from ..utils import RateLimitedError
+
+    headers = {
+        'Authorization': f"Bearer {token.tokens().get('user-read-email')}",
+        'app-platform': 'WebPlayer',
+    }
+    resp = requests.get(
+        f"https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}",
+        headers=headers
+    )
+    if resp.status_code == 429:
+        raise RateLimitedError(retry_after=int(resp.headers.get('Retry-After', 30)), url=resp.url)
+    if resp.status_code != 200:
+        logger.error(f"spclient playlist returned status {resp.status_code}")
+        return []
+
+    contents = Playlist4External_pb2.SelectedListContent()
+    contents.ParseFromString(resp.content)
+
     items = []
-    offset = 0
-    limit = 100
-
-    while True:
-        url = f'{BASE_URL}/playlists/{playlist_id}/tracks?additional_types=track%2Cepisode&offset={offset}&limit={limit}'
-        headers = {}
-        headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
-
-        resp = make_call(url, headers=headers, skip_cache=True)
-
-        offset += limit
-        items.extend(resp['items'])
-
-        if resp['total'] <= offset:
-            break
+    for item in contents.contents.items:
+        uri = item.uri
+        if not uri:
+            continue
+        parts = uri.split(':')
+        if len(parts) < 3:
+            continue
+        uri_type = parts[1]
+        uri_id = parts[2]
+        if uri_type == 'track':
+            items.append({'track': {'id': uri_id, 'type': 'track'}})
+        elif uri_type == 'episode':
+            items.append({'track': {'id': uri_id, 'type': 'episode'}})
     return items
 
 
@@ -444,193 +496,224 @@ def spotify_get_your_episodes(token):
 
 def spotify_get_album_track_ids(token, album_id):
     logger.info(f"Getting tracks from album: {album_id}")
-    tracks = []
-    offset = 0
-    limit = 50
+    from librespot.metadata import AlbumId, TrackId
+    from librespot.proto import Metadata_pb2
+    from ..utils import RateLimitedError
 
-    while True:
-        url=f'{BASE_URL}/albums/{album_id}/tracks?offset={offset}&limit={limit}'
-        headers = {}
-        headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
-        resp = make_call(url, headers=headers)
+    headers = {
+        'Authorization': f"Bearer {token.tokens().get('user-read-email')}",
+        'app-platform': 'WebPlayer',
+    }
+    album_gid = AlbumId.from_base62(album_id).hex_id()
+    resp = requests.get(
+        f"https://spclient.wg.spotify.com/metadata/4/album/{album_gid}",
+        headers=headers
+    )
+    if resp.status_code == 429:
+        raise RateLimitedError(retry_after=int(resp.headers.get('Retry-After', 30)), url=resp.url)
+    if resp.status_code != 200:
+        logger.error(f"spclient album metadata returned status {resp.status_code}")
+        return []
 
-        offset += limit
-        tracks.extend(resp['items'])
-
-        if resp['total'] <= offset:
-            break
+    album = Metadata_pb2.Album()
+    album.ParseFromString(resp.content)
 
     item_ids = []
-    for track in tracks:
-        if track:
-            item_ids.append(track['id'])
+    for disc in album.disc:
+        for track in disc.track:
+            track_id = TrackId.from_hex(track.gid.hex()).to_spotify_uri().split(':')[-1]
+            item_ids.append(track_id)
     return item_ids
 
 
 def spotify_get_search_results(token, search_term, content_types):
     logger.info(f"Get search result for term '{search_term}'")
 
-    headers = {}
-    headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
+    from urllib.parse import quote
+    from hashlib import md5
 
-    params = {}
-    params['limit'] = config.get("max_search_results")
-    params['offset'] = '0'
-    params['q'] = search_term
-    params['type'] = ",".join(c_type for c_type in content_types)
+    headers = {
+        'Authorization': f"Bearer {token.tokens().get('user-read-email')}",
+        'app-platform': 'WebPlayer',
+    }
 
-    data = requests.get(f"{BASE_URL}/search", params=params, headers=headers).json()
+    limit = config.get("max_search_results")
+    encoded_query = quote(search_term)
+    search_url = (
+        f"https://spclient.wg.spotify.com/searchview/km/v4/search/{encoded_query}"
+        f"?limit={limit}&imageSize=default&catalogue=&country=&locale=en"
+        f"&platform=zelda&entity-version=v2"
+    )
+
+    cache_key = md5(search_url.encode()).hexdigest()
+    cache_file = os.path.join(config.get('_cache_dir'), 'reqcache', cache_key + '.json')
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+
+    if os.path.isfile(cache_file):
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    else:
+        response = requests.get(search_url, headers=headers)
+        if response.status_code == 429:
+            raise SpotifyRateLimitError(int(response.headers.get('Retry-After', 30)))
+        if response.status_code != 200:
+            logger.error(f"spclient search returned status {response.status_code}: {response.text[:500]}")
+            return []
+        data = response.json()
+        logger.debug(f"spclient search raw response keys: {list(data.keys())}")
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+    results_data = data.get('results', {})
+    if not results_data:
+        logger.error(f"spclient search returned no 'results' key. Top-level keys: {list(data.keys())}")
+        return []
+
+    # Map spclient section names → item_type strings
+    section_type_map = {
+        'tracks': 'track',
+        'albums': 'album',
+        'artists': 'artist',
+        'playlists': 'playlist',
+        'podcasts': 'podcast',
+        'episodes': 'podcast_episode',
+    }
+
+    def _extract_id(uri):
+        return uri.split(':')[-1] if uri else ''
 
     search_results = []
-    for key in data.keys():
-        for item in data[key]["items"]:
-            item_type = item['type']
-            if item_type == "track":
-                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
-                item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item['artists']])}"
-                item_thumbnail_url = item['album']['images'][-1]["url"] if len(item['album']['images']) > 0 else ""
-            elif item_type == "album":
-                rel_year = re.search(r'(\d{4})', item['release_date']).group(1)
-                item_name = f"[Y:{rel_year}] [T:{item['total_tracks']}] {item['name']}"
-                item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item['artists']])}"
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-            elif item_type == "playlist":
-                item_name = f"{item['name']}"
-                item_by = f"{item['owner']['display_name']}"
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-            elif item_type == "artist":
-                item_name = item['name']
-                if f"{'/'.join(item['genres'])}" != "":
-                    item_name = item['name'] + f"  |  GENERES: {'/'.join(item['genres'])}"
-                item_by = f"{item['name']}"
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-            elif item_type == "show":
-                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
-                item_by = f"{item['publisher']}"
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-                item_type = "podcast"
-            elif item_type == "episode":
-                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
-                item_by = ""
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-                item_type = "podcast_episode"
-            elif item_type == "audiobook":
-                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
-                item_by = f"{item['publisher']}"
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
+    for section_key, item_type in section_type_map.items():
+        hits = results_data.get(section_key, {}).get('hits', [])
+        for item in hits:
+            uri = item.get('uri', '')
+            item_id = _extract_id(uri)
+            if not item_id:
+                continue
+
+            # spclient returns image as a plain CDN URL string at the top level
+            item_thumbnail_url = item.get('image', '')
+
+            try:
+                if item_type == 'track':
+                    item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}".strip()
+                    item_by = config.get('metadata_separator').join(a['name'] for a in item.get('artists', []))
+                elif item_type == 'album':
+                    year = item.get('year', '')
+                    track_count = item.get('trackCount', '?')
+                    item_name = f"[Y:{year}] [T:{track_count}] {item['name']}"
+                    item_by = config.get('metadata_separator').join(a['name'] for a in item.get('artists', []))
+                elif item_type == 'playlist':
+                    item_name = item['name']
+                    item_by = item.get('owner', {}).get('name', '')
+                elif item_type == 'artist':
+                    genres = '/'.join(item.get('genres', []))
+                    item_name = item['name'] + (f"  |  GENRES: {genres}" if genres else '')
+                    item_by = item['name']
+                elif item_type in ('podcast', 'podcast_episode'):
+                    item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}".strip()
+                    item_by = item.get('publisher', item.get('show', {}).get('name', ''))
+                else:
+                    continue
+            except (KeyError, TypeError) as e:
+                logger.warning(f"spclient search: skipping malformed {item_type} hit ({e}): {item}")
+                continue
 
             search_results.append({
-                'item_id': item['id'],
+                'item_id': item_id,
                 'item_name': item_name,
                 'item_by': item_by,
                 'item_type': item_type,
-                'item_service': "spotify",
-                'item_url': item['external_urls']['spotify'],
-                'item_thumbnail_url': item_thumbnail_url
+                'item_service': 'spotify',
+                'item_url': f"https://open.spotify.com/{item_type.replace('_', '-')}/{item_id}",
+                'item_thumbnail_url': item_thumbnail_url,
             })
     return search_results
 
 
 def spotify_get_track_metadata(token, item_id):
-    headers = {}
-    headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
+    from librespot.metadata import TrackId
+    from librespot.proto import Metadata_pb2
+    from ..utils import RateLimitedError
 
-    track_data = make_call(f'{BASE_URL}/tracks?ids={item_id}&market=from_token', headers=headers)
-    album_data = make_call(f"{BASE_URL}/albums/{track_data.get('tracks', [])[0].get('album', {}).get('id')}", headers=headers)
-    artist_data = make_call(f"{BASE_URL}/artists/{track_data.get('tracks', [])[0].get('artists', [])[0].get('id')}", headers=headers)
-    album_track_ids = spotify_get_album_track_ids(token, track_data.get('tracks', [])[0].get('album', {}).get('id'))
+    headers = {
+        'Authorization': f"Bearer {token.tokens().get('user-read-email')}",
+        'app-platform': 'WebPlayer',
+    }
+
+    track_gid = TrackId.from_base62(item_id).hex_id()
+    resp = requests.get(
+        f"https://spclient.wg.spotify.com/metadata/4/track/{track_gid}",
+        headers=headers
+    )
+    if resp.status_code == 429:
+        retry_after = int(resp.headers.get('Retry-After', 30))
+        raise RateLimitedError(retry_after=retry_after, url=resp.url)
+    if resp.status_code != 200:
+        logger.error(f"spclient track metadata returned {resp.status_code}: {resp.text[:200]}")
+        return None
+
+    track = Metadata_pb2.Track()
+    track.ParseFromString(resp.content)
+
+    def file_id_to_url(fid):
+        return f"https://i.scdn.co/image/{fid.hex()}" if fid else ''
+
+    # Best quality cover image
+    image_url = ''
+    covers = list(track.album.cover_group.image) or list(track.album.cover)
+    if covers:
+        image_url = file_id_to_url(sorted(covers, key=lambda i: i.size, reverse=True)[0].file_id)
+
+    # ISRC
+    isrc = next((e.id for e in track.external_id if e.type == 'isrc'), '')
+
+    # Album type
+    album_type = {1: 'album', 2: 'single', 3: 'compilation', 4: 'ep'}.get(track.album.type, 'album')
+
+    # Total tracks/discs from disc structure
+    total_tracks = sum(len(d.track) for d in track.album.disc) or 1
+    total_discs = max((d.number for d in track.album.disc), default=1)
+
+    info = {
+        'artists': conv_list_format([a.name for a in track.artist]),
+        'album_name': track.album.name,
+        'album_type': album_type,
+        'album_artists': track.album.artist[0].name if track.album.artist else '',
+        'title': track.name,
+        'image_url': image_url,
+        'release_year': str(track.album.date.year) if track.album.date.year else '',
+        'track_number': track.number,
+        'total_tracks': total_tracks,
+        'disc_number': track.disc_number,
+        'total_discs': total_discs,
+        'genre': conv_list_format(list(track.album.genre)),
+        'label': track.album.label,
+        'copyright': conv_list_format([c.text for c in track.album.copyright]),
+        'explicit': track.explicit,
+        'isrc': isrc,
+        'length': str(track.duration),
+        'item_url': f"https://open.spotify.com/track/{item_id}",
+        'item_id': item_id,
+        'is_playable': True,
+    }
+
     try:
-        track_audio_data = make_call(f'{BASE_URL}/audio-features/{item_id}', headers=headers)
+        credits_data = make_call(
+            f'https://spclient.wg.spotify.com/track-credits-view/v0/experimental/{item_id}/credits',
+            headers=headers
+        )
+        if credits_data:
+            credits = {}
+            for block in credits_data.get('roleCredits', []):
+                role = block.get('roleTitle', '').lower()
+                credits[role] = [a.get('name') for a in block.get('artists', [])]
+            info['performers'] = conv_list_format([x for x in credits.get('performers', []) if isinstance(x, str)])
+            info['producers'] = conv_list_format([x for x in credits.get('producers', []) if isinstance(x, str)])
+            info['writers'] = conv_list_format([x for x in credits.get('writers', []) if isinstance(x, str)])
     except Exception:
-        track_audio_data = ''
-    try:
-        credits_data = make_call(f'https://spclient.wg.spotify.com/track-credits-view/v0/experimental/{item_id}/credits', headers=headers)
-    except Exception:
-        credits_data = ''
+        pass
 
-    # Artists
-    artists = []
-    for data in track_data.get('tracks', [{}])[0].get('artists', []):
-        artists.append(data.get('name'))
-    artists = conv_list_format(artists)
-
-    # Track Number
-    track_number = None
-    if album_track_ids:
-        for i, track_id in enumerate(album_track_ids):
-            if track_id == str(item_id):
-                track_number = i + 1
-                break
-    if not track_number:
-        track_number = track_data.get('tracks', [{}])[0].get('track_number')
-
-    info = {}
-    info['artists'] = artists
-    info['album_name'] = track_data.get('tracks', [{}])[0].get('album', {}).get("name", '')
-    info['album_type'] = album_data.get('album_type')
-    info['album_artists'] = album_data.get('artists', [{}])[0].get('name')
-    info['title'] = track_data.get('tracks', [{}])[0].get('name')
-
-    try:
-        info['image_url'] = track_data.get('tracks', [{}])[0].get('album', {}).get('images', [{}])[0].get('url')
-    except IndexError:
-        info['image_url'] = ''
-        logger.info('Invalid thumbnail')
-
-    info['release_year'] = track_data.get('tracks', [{}])[0].get('album', {}).get('release_date').split("-")[0]
-    #info['track_number'] = track_data.get('tracks', [{}])[0].get('track_number')
-    info['track_number'] = track_number
-    info['total_tracks'] = track_data.get('tracks', [{}])[0].get('album', {}).get('total_tracks')
-    info['disc_number'] = track_data.get('tracks', [{}])[0].get('disc_number')
-    info['total_discs'] = sorted([trk.get('disc_number', 0) for trk in album_data.get('tracks', {}).get('items', [])])[-1] if 'tracks' in album_data else 1
-    info['genre'] = conv_list_format(artist_data.get('genres', []))
-    info['label'] = album_data.get('label')
-    info['copyright'] = conv_list_format([holder.get('text') for holder in album_data.get('copyrights', [])])
-    info['explicit'] = track_data.get('tracks', [{}])[0].get('explicit', False)
-    info['isrc'] = track_data.get('tracks', [{}])[0].get('external_ids', {}).get('isrc')
-    info['length'] = str(track_data.get('tracks', [{}])[0].get('duration_ms'))
-    info['item_url'] = track_data.get('tracks', [{}])[0].get('external_urls', {}).get('spotify')
-    #info['popularity'] = track_data.get('tracks', [{}])[0].get('popularity')
-    info['item_id'] = track_data.get('tracks', [{}])[0].get('id')
-    info['is_playable'] = track_data.get('tracks', [{}])[0].get('is_playable', False)
-
-    if credits_data:
-        credits = {}
-        for credit_block in credits_data.get('roleCredits', []):
-            role_title = credit_block.get('roleTitle').lower()
-            credits[role_title] = [
-                artist.get('name') for artist in credit_block.get('artists', [])
-            ]
-        info['performers'] = conv_list_format([item for item in credits.get('performers', []) if isinstance(item, str)])
-        info['producers'] = conv_list_format([item for item in credits.get('producers', []) if isinstance(item, str)])
-        info['writers'] = conv_list_format([item for item in credits.get('writers', []) if isinstance(item, str)])
-
-    if track_audio_data:
-        key_mapping = {
-            0: "C",
-            1: "C♯/D♭",
-            2: "D",
-            3: "D♯/E♭",
-            4: "E",
-            5: "F",
-            6: "F♯/G♭",
-            7: "G",
-            8: "G♯/A♭",
-            9: "A",
-            10: "A♯/B♭",
-            11: "B"
-        }
-        info['bpm'] = str(track_audio_data.get('tempo'))
-        info['key'] = str(key_mapping.get(track_audio_data.get('key'), ''))
-        info['time_signature'] = track_audio_data.get('time_signature')
-        info['acousticness'] = track_audio_data.get('acousticness')
-        info['danceability'] = track_audio_data.get('danceability')
-        info['energy'] = track_audio_data.get('energy')
-        info['instrumentalness'] = track_audio_data.get('instrumentalness')
-        info['liveness'] = track_audio_data.get('liveness')
-        info['loudness'] = track_audio_data.get('loudness')
-        info['speechiness'] = track_audio_data.get('speechiness')
-        info['valence'] = track_audio_data.get('valence')
     return info
 
 

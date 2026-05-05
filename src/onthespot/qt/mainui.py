@@ -5,16 +5,16 @@ import time
 import traceback
 from urllib3.exceptions import MaxRetryError, NewConnectionError
 from PyQt6 import uic, QtGui
-from PyQt6.QtCore import QThread, QDir, Qt, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import QThread, QDir, Qt, pyqtSignal, QObject, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QIcon, QColor
-from PyQt6.QtWidgets import QApplication, QMainWindow, QHeaderView, QLabel, QPushButton, QProgressBar, QTableWidgetItem, QFileDialog, QRadioButton, QHBoxLayout, QWidget, QColorDialog
+from PyQt6.QtWidgets import QApplication, QMainWindow, QHeaderView, QLabel, QPushButton, QProgressBar, QTableWidgetItem, QFileDialog, QRadioButton, QHBoxLayout, QWidget, QColorDialog, QGraphicsOpacityEffect
 from ..accounts import get_account_token, FillAccountPool
 from ..api.apple_music import apple_music_add_account, apple_music_get_track_metadata
 from ..api.bandcamp import bandcamp_add_account, bandcamp_get_track_metadata
 from ..api.deezer import deezer_add_account, deezer_get_track_metadata
 from ..api.qobuz import qobuz_add_account, qobuz_get_track_metadata
 from ..api.soundcloud import soundcloud_add_account, soundcloud_get_token, soundcloud_get_track_metadata
-from ..api.spotify import MirrorSpotifyPlayback, spotify_get_token, spotify_get_track_metadata, spotify_get_podcast_episode_metadata, spotify_new_session
+from ..api.spotify import MirrorSpotifyPlayback, SpotifyRateLimitError, spotify_get_token, spotify_get_track_metadata, spotify_get_podcast_episode_metadata, spotify_new_session
 from ..api.tidal import tidal_add_account_pt1, tidal_add_account_pt2, tidal_get_track_metadata
 from ..api.youtube_music import youtube_music_add_account, youtube_music_get_track_metadata
 from ..api.generic import generic_add_account, generic_get_track_metadata, generic_list_extractors
@@ -25,7 +25,7 @@ from ..runtimedata import account_pool, download_queue, download_queue_lock, get
 from .dl_progressbtn import DownloadActionsButtons
 from .settings import load_config, save_config
 from .thumb_listitem import LabelWithThumb
-from ..utils import is_latest_release, open_item, format_bytes
+from ..utils import is_latest_release, open_item, format_bytes, RateLimitedError
 from ..search import get_search_results
 
 logger = get_logger('gui.main_ui')
@@ -60,10 +60,16 @@ class QueueWorker(QObject):
                         if config.get('show_download_thumbnails'):
                             time.sleep(0.1)
                     continue
+                except RateLimitedError as e:
+                    logger.warning(f"Rate limited fetching metadata for {item['item_id']}, backing off {e.retry_after}s")
+                    time.sleep(e.retry_after)
+                    with pending_lock:
+                        pending[local_id] = item
                 except Exception as e:
                     logger.error(f"Unknown Exception for {item}: {str(e)}\nTraceback: {traceback.format_exc()}")
                     with pending_lock:
                         pending[local_id] = item
+                    time.sleep(5)
             else:
                 time.sleep(0.2)
 
@@ -72,6 +78,94 @@ class QueueWorker(QObject):
         logger.info('Stopping Queue Worker')
         self.is_running = False
         self.thread.join()
+
+
+class SearchWorker(QThread):
+    finished = pyqtSignal(object)
+    status = pyqtSignal(str)
+
+    def __init__(self, search_term, content_types):
+        super().__init__()
+        self.search_term = search_term
+        self.content_types = content_types
+
+    def run(self):
+        try:
+            results = get_search_results(self.search_term, self.content_types)
+            self.finished.emit(results)
+        except SpotifyRateLimitError as e:
+            if e.retry_after > 60:
+                self.status.emit(f"Spotify rate limited for {e.retry_after}s — try another service.")
+                self.finished.emit("rate_limited")
+            else:
+                for i in range(e.retry_after, 0, -1):
+                    self.status.emit(f"Rate limited — retrying in {i}s…")
+                    time.sleep(1)
+                try:
+                    results = get_search_results(self.search_term, self.content_types)
+                    self.finished.emit(results)
+                except Exception as retry_err:
+                    logger.error(f"Search failed after rate-limit retry: {retry_err}\nTraceback: {traceback.format_exc()}")
+                    self.finished.emit("rate_limited")
+        except Exception as e:
+            logger.error(f"Search failed: {e}\nTraceback: {traceback.format_exc()}")
+            self.finished.emit(False)
+
+
+class ToastNotification(QWidget):
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint |
+                         Qt.WindowType.Tool |
+                         Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        self._label = QLabel(self)
+        self._label.setWordWrap(True)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setStyleSheet("""
+            QLabel {
+                background-color: rgba(40, 40, 40, 230);
+                color: white;
+                padding: 10px 16px;
+                border-radius: 8px;
+                font-size: 13px;
+            }
+        """)
+
+        self._effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._effect)
+
+        self._anim = QPropertyAnimation(self._effect, b"opacity")
+        self._anim.setDuration(700)
+        self._anim.setEasingCurve(QEasingCurve.Type.InQuad)
+        self._anim.setStartValue(1.0)
+        self._anim.setEndValue(0.0)
+        self._anim.finished.connect(self.hide)
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._anim.start)
+
+    def show_message(self, message, anchor_widget=None, duration=4000):
+        self._anim.stop()
+        self._timer.stop()
+        self._effect.setOpacity(1.0)
+
+        self._label.setText(message)
+        self._label.adjustSize()
+        self.resize(self._label.sizeHint().width() + 32,
+                    self._label.sizeHint().height() + 20)
+        self._label.resize(self.size())
+
+        if anchor_widget:
+            geo = anchor_widget.frameGeometry()
+            x = geo.x() + geo.width() - self.width() - 16
+            y = geo.y() + geo.height() - self.height() - 16
+            self.move(x, y)
+
+        self.show()
+        self._timer.start(duration)
 
 
 class MainWindow(QMainWindow):
@@ -98,6 +192,7 @@ class MainWindow(QMainWindow):
         load_config(self)
 
         self.__splash_dialog = _dialog
+        self._toast = ToastNotification()
 
         # Start/create session builder and queue processor
         fillaccountpool = FillAccountPool(gui=True)
@@ -466,6 +561,7 @@ class MainWindow(QMainWindow):
                 "item_service": item["item_service"],
                 "item_type": item["item_type"],
                 'item_id': item['item_id'],
+                'item_name': title,
                 'item_status': 'Waiting',
                 "file_path": None,
                 'parent_category': item['parent_category'],
@@ -500,12 +596,21 @@ class MainWindow(QMainWindow):
                 if config.get("download_copy_btn"):
                     item['gui']['btn']['copy'].show()
                 item['gui']["btn"]['retry'].hide()
+                self._toast.show_message(
+                    self.tr("Unavailable: {0}").format(item.get('item_name', item['item_id'])),
+                    anchor_widget=self
+                )
                 return
             elif progress == 0:
                 item['gui']["btn"]['cancel'].hide()
                 if config.get("download_copy_btn"):
                     item['gui']['btn']['copy'].show()
                 item['gui']["btn"]['retry'].show()
+                if item['item_status'] == 'Failed':
+                    self._toast.show_message(
+                        self.tr("Download failed: {0}").format(item.get('item_name', item['item_id'])),
+                        anchor_widget=self
+                    )
                 return
             elif progress == 100:
                 item['gui']['btn']['cancel'].hide()
@@ -856,22 +961,49 @@ class MainWindow(QMainWindow):
         if self.enable_search_audiobooks.isChecked():
             content_types.append('audiobook')
 
-        results = get_search_results(search_term, content_types)
+        self.btn_search.setEnabled(False)
+        self.search_term.setEnabled(False)
+
+        searching_label = QLabel(self.tbl_search_results)
+        searching_label.setText(self.tr("Searching..."))
+        searching_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        searching_label.setStyleSheet("background-color: transparent;")
+        self.tbl_search_results.insertRow(0)
+        self.tbl_search_results.setCellWidget(0, 0, searching_label)
+
+        self._searching_label = searching_label
+        self._search_worker = SearchWorker(search_term, content_types)
+        self._search_worker.finished.connect(self._on_search_results)
+        self._search_worker.status.connect(self._on_search_status)
+        self._search_worker.start()
+
+
+    def _on_search_status(self, message):
+        self._searching_label.setText(message)
+
+
+    def _on_search_results(self, results):
+        self.btn_search.setEnabled(True)
+        self.search_term.setEnabled(True)
+        self.search_term.setText('')
+
+        while self.tbl_search_results.rowCount() > 0:
+            self.tbl_search_results.removeRow(0)
+
         if results is None:
             self.show_popup_dialog(self.tr("You need to login to at least one account to use this feature."))
-            self.search_term.setText('')
+            return
+        elif results == "rate_limited":
+            self.show_popup_dialog(self.tr("Spotify search is rate limited. Please wait a moment or switch to another service in the Accounts tab."))
             return
         elif results is True:
             self.show_popup_dialog(self.tr("Item is being parsed and will be added to the download queue shortly."))
-            self.search_term.setText('')
             return
         elif results is False and account_pool[config.get('active_account_number')]['service'] == 'generic':
             self.show_popup_dialog(self.tr("Generic Downloader does not support search, please enter a supported url."))
-            self.search_term.setText('')
             return
         elif results is False:
             self.show_popup_dialog(self.tr("Invalid item, please check your query or account settings"))
-            self.search_term.setText('')
             return
 
         def download_btn_clicked(item_name, item_url, item_service, item_type, item_id):
@@ -927,7 +1059,7 @@ class MainWindow(QMainWindow):
                 self.tbl_search_results.setRowHeight(rows, config.get("thumbnail_size"))
                 item_label = LabelWithThumb(result['item_name'], result['item_thumbnail_url'])
             else:
-                item_label = QLabel(self.tbl_dl_progress)
+                item_label = QLabel(self.tbl_search_results)
                 item_label.setText(result['item_name'])
             item_label.setStyleSheet("background-color: transparent;")
 
@@ -938,8 +1070,6 @@ class MainWindow(QMainWindow):
             self.tbl_search_results.setCellWidget(rows, 4, btn_widget)
             self.tbl_search_results.horizontalHeader().resizeSection(0, 450)
             self.tbl_search_results.horizontalHeader().resizeSection(4, 100)
-
-            self.search_term.setText('')
 
 
     def update_table_visibility(self):
